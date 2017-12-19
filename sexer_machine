@@ -1,17 +1,10 @@
 #!/usr/bin/env julia
 
-# Plan:
-#   - input is some number of bam files
-#   - we also need to know where XIST is (read a GFF file?)
-#   - train some kind of simple classifier
-#        Maybe just do EM with Beta 
-#       
-
-
-
 using ArgParse
 using BioAlignments
+using Distributions
 using GenomicFeatures
+using Optim
 
 
 """
@@ -24,6 +17,25 @@ function Base.haskey(record::GFF3.Record, key::String)
         end
     end
     return false
+end
+
+
+"""
+Compute log(exp(x) + exp(y))
+"""
+function logaddexp(x::Real, y::Real)
+    if x == y
+        return x + log(2.)
+    else
+        tmp = x - y
+        if tmp > zero(tmp)
+            return x + log1p(exp(-tmp))
+        elseif tmp <= 0.
+            return y + log1p(exp(tmp))
+        else
+            return tmp  # NaNs
+        end
+    end
 end
 
 
@@ -97,12 +109,12 @@ end
 Read a GFF file to find the locus containing every XIST transcript.
 """
 function find_xist_locus(filename)
-    println("Reading GFF file...")
+    println(STDERR, "Reading GFF file...")
     reader = open(GFF3.Reader, filename)
     entry = eltype(reader)()
 
     transcript_count = 0
-    xist_seqname = "X"
+    xist_seqname = ""
     xist_stop = -1
     xist_start = -1
 
@@ -118,7 +130,11 @@ function find_xist_locus(filename)
         gene_name = haskey(entry, "Name") ? GFF3.attributes(entry, "Name")[1] : ""
         if contains(gene_name, "XIST")
             transcript_count += 1
-            xist_seqname = GFF3.seqid(entry)
+            if xist_start != -1 && xist_seqname != GFF3.seqid(entry)
+                error("XIST found on both $(xist_seqname) and $(GFF3.seqid(entry))")
+            else
+                xist_seqname = GFF3.seqid(entry)
+            end
 
             start, stop = GFF3.seqstart(entry), GFF3.seqend(entry)
             xist_start = xist_start == -1 ? start : min(xist_start, start)
@@ -130,8 +146,99 @@ function find_xist_locus(filename)
         error("No XIST gene found in GFF file.")
     end
 
-    println("XIST found at $(xist_seqname):$(xist_start)-$(xist_stop)")
+    println(STDERR, "XIST found at $(xist_seqname):$(xist_start)-$(xist_stop)")
     return Interval(xist_seqname, xist_start, xist_stop)
+end
+
+
+"""
+Fit a simple two component Beta mixture model to classify male/female samples.
+
+
+This assumes that there are some number of both male and female samples, and
+could fail if that is not the case.
+"""
+function train_classifier(counts)
+    n = length(counts)
+    xs = Array{Float64}(n, 2)
+    for i in 1:n
+        xs[i, 1] = counts[i][1] / counts[i][3]
+        xs[i, 2] = counts[i][2] / counts[i][3]
+    end
+
+    # find dimension is female/male, second is ychrom/xist
+    log_alpha0 = log.([ 1e-2  1e-1
+                       1e-1  2e-2 ])
+    log_beta0  = zeros(Float64, (2, 2))
+    params = Array{Float64}(2, 2, 2)
+    params[1,:,:] = log_alpha0
+    params[2,:,:] = log_beta0
+
+    zs = Array{Float64}(n, 2)
+
+    # objcetive function for optimizing params, given zs
+    function f(params_)
+        params = reshape(params_, (2, 2, 2))
+        lp = 0.0
+        for i in 1:n
+            p1 = log(zs[i, 1]) +
+                logpdf(Beta(exp(params[1, 1, 1]), exp(params[2, 1, 1])), xs[i, 1]) +
+                logpdf(Beta(exp(params[1, 1, 2]), exp(params[2, 1, 2])), xs[i, 2])
+
+            p2 = log(zs[i, 2]) +
+                logpdf(Beta(exp(params[1, 2, 1]), exp(params[2, 2, 1])), xs[i, 1]) +
+                logpdf(Beta(exp(params[1, 2, 2]), exp(params[2, 2, 2])), xs[i, 2])
+
+            lp += logaddexp(p1, p2)
+        end
+
+        return -lp
+    end
+
+    function g!(params)
+    end
+
+    niter = 20
+    for it in 1:niter
+        # E step
+        for i in 1:n, j in 1:2
+            logprob =
+                logpdf(Beta(exp(params[1, j, 1]), exp(params[2, j, 1])), xs[i, 1]) +
+                logpdf(Beta(exp(params[1, j, 2]), exp(params[2, j, 2])), xs[i, 2])
+
+            zs[i, j] = exp(logprob)
+        end
+
+        for i in 1:n
+            d = zs[i, 1] + zs[i, 2]
+            zs[i, 1] = zs[i, 1] / d
+            zs[i, 2] = zs[i, 2] / d
+        end
+
+        # M step
+        # TODO: gradients
+        result = optimize(f, reshape(params, 8), LBFGS())
+        params = reshape(Optim.minimizer(result), (2, 2, 2))
+    end
+
+    # labels could switch, so see which component is male/female, and error
+    # if it's incoherent
+    ychrom_prop_dist_1 = Beta(exp(params[1, 1, 1]), exp(params[2, 1, 1]))
+    ychrom_prop_dist_2 = Beta(exp(params[1, 2, 1]), exp(params[2, 2, 1]))
+    xist_prop_dist_1 = Beta(exp(params[1, 1, 2]), exp(params[2, 1, 2]))
+    xist_prop_dist_2 = Beta(exp(params[1, 2, 2]), exp(params[2, 2, 2]))
+
+    if mean(ychrom_prop_dist_1) < mean(ychrom_prop_dist_2) &&
+       mean(xist_prop_dist_1)   > mean(xist_prop_dist_2)
+       female_idx, male_idx = 1, 2
+    elseif mean(ychrom_prop_dist_1) > mean(ychrom_prop_dist_2) &&
+          mean(xist_prop_dist_1)   < mean(xist_prop_dist_2)
+       female_idx, male_idx = 2, 1
+    else
+        error("Unable to classify sex in a coherent manner. Possibly all samples are of the same sex.")
+    end
+
+    return hcat(zs[:, female_idx], zs[:, male_idx])
 end
 
 
@@ -151,18 +258,36 @@ function main()
     parsed_args = parse_args(ARGS, argparser)
     xist_locus = find_xist_locus(parsed_args["gff_filename"])
 
-    println("Reading BAM files")
-    results = Tuple{Int, Int, Int}[]
+    println(STDERR, "Reading BAM files")
+    counts = Tuple{Int, Int, Int}[]
     for bam_filename in parsed_args["bam_filenames"]
-        println("  ", bam_filename)
-        push!(results,
+        println(STDERR, "  ", bam_filename)
+        push!(counts,
               process_bam_file(bam_filename, xist_locus,
                                parsed_args["decompress_cmd"]))
     end
 
-    println(results)
+    sex_probs = train_classifier(counts)
+    println("filename,ychrom_count,xist_count,total_count,female_prob,male_prob")
+    for (i, bam_filename) in enumerate(parsed_args["bam_filenames"])
+        @printf("%s,%d,%d,%d,%f,%f\n",
+                bam_filename, counts[i][1], counts[i][2], counts[i][3],
+                sex_probs[i][1], sex_probs[i][2])
+    end
 end
 
 main()
+
+
+
+#counts = Tuple{Int, Int, Int}[
+               #(20000, 1000, 10000000), 
+               #(25000, 1200, 20000000), 
+               #(15000, 2000, 21000000), 
+               #(2000, 10000, 10000000), 
+               #(2000, 12000, 20000000), 
+               #(1000, 20000, 21000000) ]
+
+#@show train_classifier(counts)
 
 
