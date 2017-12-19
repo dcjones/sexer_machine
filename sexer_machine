@@ -1,0 +1,168 @@
+#!/usr/bin/env julia
+
+# Plan:
+#   - input is some number of bam files
+#   - we also need to know where XIST is (read a GFF file?)
+#   - train some kind of simple classifier
+#        Maybe just do EM with Beta 
+#       
+
+
+
+using ArgParse
+using BioAlignments
+using GenomicFeatures
+
+
+"""
+Check a GFF entry for the given key.
+"""
+function Base.haskey(record::GFF3.Record, key::String)
+    for (i, k) in enumerate(record.attribute_keys)
+        if GFF3.isequaldata(key, record.data, k)
+            return true
+        end
+    end
+    return false
+end
+
+
+"""
+Read the contents of a BAM file, count number of alignments to Y chromosome,
+XIST, and total alignments.
+"""
+function process_bam_file(filename, xist_locus, decompress_cmd=nothing)
+    if decompress_cmd != nothing
+        decomp = Cmd(collect(String, split(decompress_cmd)))
+        input, proc = open(`$(decomp) $(filename)`)
+        reader = BAM.Reader(input)
+    else
+        reader = open(BAM.Reader, filename)
+    end
+
+    ychrom_refidx = -1
+    xist_seqname_refidx = -1
+    for (refidx, seqname) in enumerate(reader.refseqnames)
+        if seqname == "Y" || seqname == "chrY"
+            ychrom_refidx = refidx
+        end
+
+        if seqname == xist_locus.seqname
+            xist_seqname_refidx = refidx
+        end
+    end
+    if ychrom_refidx == -1
+        error("BAM file header has no Y chromosome.")
+    end
+    if xist_seqname_refidx == -1
+        error("BAM file header has no $(xist_locus.seqname) chromosome where XIST is expected to be.")
+    end
+
+    entry = eltype(reader)()
+    alignment_count = 0
+    ychrom_count = 0
+    xist_count = 0
+    while !eof(reader)
+        try
+            read!(reader, entry)
+        catch ex
+            if isa(ex, EOFError)
+                break
+            end
+        end
+
+        if !BAM.ismapped(entry)
+            continue
+        end
+
+        alignment_count += 1
+
+        if entry.refid + 1 == ychrom_refidx
+            ychrom_count += 1
+        end
+
+        if entry.refid + 1 == xist_seqname_refidx
+            if leftposition(entry) <= xist_locus.last &&
+               rightposition(entry) >= xist_locus.first
+                xist_count += 1
+            end
+        end
+    end
+
+    return (ychrom_count, xist_count, alignment_count)
+end
+
+
+"""
+Read a GFF file to find the locus containing every XIST transcript.
+"""
+function find_xist_locus(filename)
+    println("Reading GFF file...")
+    reader = open(GFF3.Reader, filename)
+    entry = eltype(reader)()
+
+    transcript_count = 0
+    xist_seqname = "X"
+    xist_stop = -1
+    xist_start = -1
+
+    while !eof(reader)
+        try
+            read!(reader, entry)
+        catch ex
+            if isa(ex, EOFError)
+                break
+            end
+        end
+
+        gene_name = haskey(entry, "Name") ? GFF3.attributes(entry, "Name")[1] : ""
+        if contains(gene_name, "XIST")
+            transcript_count += 1
+            xist_seqname = GFF3.seqid(entry)
+
+            start, stop = GFF3.seqstart(entry), GFF3.seqend(entry)
+            xist_start = xist_start == -1 ? start : min(xist_start, start)
+            xist_stop = xist_stop == -1 ? stop : max(xist_stop, stop)
+        end
+    end
+
+    if transcript_count == 0
+        error("No XIST gene found in GFF file.")
+    end
+
+    println("XIST found at $(xist_seqname):$(xist_start)-$(xist_stop)")
+    return Interval(xist_seqname, xist_start, xist_stop)
+end
+
+
+function main()
+    argparser = ArgParseSettings()
+
+    @add_arg_table argparser begin
+        "--decompress_cmd"
+            default=nothing
+        "gff_filename"
+            help="GFF filename used to locate XIST"
+        "bam_filenames"
+            nargs = '*'
+            help="RNA-Seq reads used to classify samples"
+    end
+
+    parsed_args = parse_args(ARGS, argparser)
+    xist_locus = find_xist_locus(parsed_args["gff_filename"])
+
+    println("Reading BAM files")
+    results = Tuple{Int, Int, Int}[]
+    for bam_filename in parsed_args["bam_filenames"]
+        println("  ", bam_filename)
+        push!(results,
+              process_bam_file(bam_filename, xist_locus,
+                               parsed_args["decompress_cmd"]))
+    end
+
+    println(results)
+end
+
+main()
+
+
